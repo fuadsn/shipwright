@@ -224,6 +224,13 @@ function isLikelyChatter(text: string): boolean {
   );
 }
 
+function detectsPRIntent(text: string): boolean {
+  if (/\b(open|create|raise|submit|make|push|file)\b[^.]*\b(pr|pull request)\b/i.test(text)) return true;
+  if (/\b(pr|pull request)\b[^.]*\b(please|it|now|too|also)\b/i.test(text)) return true;
+  if (/\bopen a pr\b|\bship a pr\b|\braise a pr\b/i.test(text)) return true;
+  return false;
+}
+
 async function handleSlackMessage(envelope: SlackEventEnvelope) {
   const event = envelope.event;
   if (!event?.channel || !event.text || !event.ts) {
@@ -277,6 +284,66 @@ async function handleSlackMessage(envelope: SlackEventEnvelope) {
     ? `:white_check_mark: ${finished.summary ?? "Done."}${finished.repo_path ? `\n*Repo:* \`${finished.repo_path}\`` : ""}${finished.branch ? `\n*Branch:* \`${finished.branch}\`` : ""}${finished.files_changed.length ? `\n*Files:* ${finished.files_changed.slice(0, 6).join(", ")}` : ""}`
     : `:x: ${finished.summary ?? "Task failed."}${finished.errors.length ? `\n${finished.errors.slice(0, 2).join("\n")}` : ""}`;
   await postSlackTaskUpdate(finished, reply, threadTs, state.slackInstall);
+
+  // Auto-PR if the user asked for one in the original Slack message.
+  const wantsPR = detectsPRIntent(event.text);
+  const prEligible =
+    wantsPR &&
+    finished.status === "succeeded" &&
+    Boolean(finished.repo_path) &&
+    Boolean(finished.branch) &&
+    finished.safety_mode !== "read_only";
+
+  if (wantsPR && finished.safety_mode === "read_only") {
+    await postSlackTaskUpdate(
+      finished,
+      `:lock: This task ran under *${finished.profile_label}* (read-only). I won't open a PR. Re-run on staging if you want a PR.`,
+      threadTs,
+      state.slackInstall
+    );
+    return;
+  }
+
+  if (!prEligible) return;
+
+  await postSlackTaskUpdate(
+    finished,
+    ":outbox_tray: Pushing branch and opening PR…",
+    threadTs,
+    state.slackInstall
+  );
+
+  const prResult = await openPullRequest({
+    repo_path: finished.repo_path!,
+    branch: finished.branch!,
+    push: true
+  });
+
+  state.task = appendEvent(
+    finished,
+    createTaskEvent(
+      prResult.ok ? "result" : "error",
+      "git",
+      prResult.message,
+      [
+        prResult.repo_path ? `repo=${prResult.repo_path}` : "repo=unknown",
+        prResult.branch ? `branch=${prResult.branch}` : "branch=none",
+        prResult.pr_url ? `pr=${prResult.pr_url}` : "pr=none"
+      ]
+    )
+  );
+  if (prResult.ok) {
+    state.task = { ...state.task, pr_url: prResult.pr_url };
+  }
+
+  await postSlackTaskUpdate(
+    state.task,
+    prResult.ok && prResult.pr_url
+      ? `:rocket: PR opened: ${prResult.pr_url}`
+      : `:warning: ${prResult.message}`,
+    threadTs,
+    state.slackInstall
+  );
 }
 
 function sessionConfig() {
